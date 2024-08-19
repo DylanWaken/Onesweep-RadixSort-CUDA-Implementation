@@ -918,6 +918,7 @@ void deviceRadixSort(uint32_t* tempMem, uint32_t tempMemSize, T *g_ikeys, T *g_o
         if (digit %2 == 1 && digit == ((sizeof(T) << 8) >> RADIX_LOG) - 1){
             // copy g_ikeys to g_okeys
             checkCUDA((cudaMemcpy(g_okeys, g_ikeys, sizeof(T) * n, cudaMemcpyDeviceToDevice)));
+            checkCUDA((cudaMemcpy(g_ovalsIndices, g_ivalsIndices, sizeof(TIndex) * n, cudaMemcpyDeviceToDevice)));
         }
     }
 }
