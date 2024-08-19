@@ -2,3 +2,7 @@
 ./cmake-build-debug
 ./.vscode
 ./.idea
+build
+cmake-build-debug
+.vscode
+.idea
