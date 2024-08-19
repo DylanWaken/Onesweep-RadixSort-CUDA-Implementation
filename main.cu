@@ -102,12 +102,8 @@ void testDeviceRadixSort(uint32_t test_size) {
     uint32_t* d_tempMem;
     cudaMalloc(&d_tempMem, tempMemSize);
 
-    std::cout << "test" << std::endl;
-
     // Perform device radix sort
-    deviceRadixSort<uint32_t, uint32_t>(d_tempMem, tempMemSize, d_input, d_output, d_indices_in, d_indices_out, test_size);
-    std::cout << "test" << std::endl;
-
+    deviceRadixSort<uint32_t>(d_tempMem, tempMemSize, d_input, d_output, d_indices_in, d_indices_out, test_size);
     // Copy result back to host
     uint32_t* h_output = new uint32_t[test_size];
     cudaMemcpy(h_output, d_output, sizeof(uint32_t) * test_size, cudaMemcpyDeviceToHost);

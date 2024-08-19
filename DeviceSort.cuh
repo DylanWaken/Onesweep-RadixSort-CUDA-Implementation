@@ -175,7 +175,6 @@ __forceinline__ __device__ void warpLevelScan(uint32_t* input, uint32_t* output,
 
 
 template<typename TKeys,
-        typename TValIndex,
         const uint32_t ITEMS_PER_THREAD,  // default 32
         const uint32_t BLOCK_SIZE, // THREADS_PER_BLOCK, default 256
         const uint32_t RADIX,
@@ -185,8 +184,8 @@ template<typename TKeys,
 __global__ void globalBinningImpl(
         TKeys *g_ikeys,
         TKeys *g_okeys,
-        TValIndex *g_ivalsIndices,
-        TValIndex *g_ovalsIndices,
+        uint32_t *g_ivalsIndices,
+        uint32_t *g_ovalsIndices,
         uint32_t *g_exclusiveCount,          // the global prefix sum
         uint32_t *g_atomicTileAssignCounter, // single value
         uint32_t *g_statusCounter,    // of size RADIX x number of TILES
@@ -815,16 +814,15 @@ inline void countExclusiveScan(uint32_t *g_globalHistogram, uint32_t *g_exclusiv
 }
 
 template<typename T, 
-        typename TIndex,
         const uint32_t ITEMS_PER_THREAD,
         const uint32_t BLOCK_SIZE,
         const uint32_t RADIX,
         const uint32_t RADIX_LOG,
         const uint32_t RADIX_MASK
         >
-inline void globalBinning(T *g_ikeys, T *g_okeys, TIndex *g_ivalsIndices, TIndex *g_ovalsIndices, uint32_t *g_exclusiveCount, uint32_t *g_atomicTileAssignCounter, uint32_t *g_statusCounter, uint32_t n, uint32_t currentDigit) {
+inline void globalBinning(T *g_ikeys, T *g_okeys, uint32_t *g_ivalsIndices, uint32_t *g_ovalsIndices, uint32_t *g_exclusiveCount, uint32_t *g_atomicTileAssignCounter, uint32_t *g_statusCounter, uint32_t n, uint32_t currentDigit) {
     const uint32_t numBlocks = (n + ITEMS_PER_THREAD * BLOCK_SIZE - 1) / (ITEMS_PER_THREAD * BLOCK_SIZE);
-    checkCUDA((globalBinningImpl<T, TIndex, ITEMS_PER_THREAD, BLOCK_SIZE, RADIX, RADIX_LOG, RADIX_MASK>
+    checkCUDA((globalBinningImpl<T, ITEMS_PER_THREAD, BLOCK_SIZE, RADIX, RADIX_LOG, RADIX_MASK>
             <<<numBlocks, BLOCK_SIZE>>>(g_ikeys, g_okeys, g_ivalsIndices, g_ovalsIndices, g_exclusiveCount, g_atomicTileAssignCounter, g_statusCounter, n, currentDigit)));
 }
 
@@ -834,10 +832,11 @@ template<typename T,
         const uint32_t ITEMS_PER_THREAD = DEFAULT_BINNING_ITEMS_PER_THREAD, 
         const uint32_t BLOCK_SIZE = DEFAULT_BINNING_BLOCK_SIZE
         >
-uint32_t getDeviceRadixSortTempMemSize(uint32_t n) {
+uint32_t getDeviceRadixSortTempMemSize(uint32_t n, bool withEmbeddedIndices = true) {
     // size of 'g_globalHistogram' + size of 'g_exclusiveCount' + size of 'g_atomicTileAssignCounter' + size of 'g_statusCounter'
     return ((sizeof(T) << 8) >> RADIX_LOG) * RADIX * sizeof(uint32_t) + sizeof(uint32_t) * RADIX * ((sizeof(T) << 8) >> RADIX_LOG)
-           + sizeof(uint32_t) + sizeof(uint32_t) * RADIX * (n + (ITEMS_PER_THREAD * BLOCK_SIZE) - 1)/(ITEMS_PER_THREAD * BLOCK_SIZE);
+           + sizeof(uint32_t) + sizeof(uint32_t) * RADIX * (n + (ITEMS_PER_THREAD * BLOCK_SIZE) - 1)/(ITEMS_PER_THREAD * BLOCK_SIZE)
+           + (withEmbeddedIndices ? 2 * sizeof(uint32_t) * n : 0);
 }
 
 
@@ -862,7 +861,7 @@ uint32_t getDeviceRadixSortTempMemSize(uint32_t n) {
 * @param g_ovalsIndices: output indices
 * @param n: number of elements
 */
-template<typename T, typename TIndex,
+template<typename T,
         const uint32_t RADIX = DEFAULT_RADIX,
         const uint32_t RADIX_LOG = DEFAULT_RADIX_LOG,
         const uint32_t RADIX_MASK = RADIX - 1,
@@ -871,7 +870,7 @@ template<typename T, typename TIndex,
         const uint32_t HIST_PART_SIZE = DEFAULT_HIST_PART_SIZE,
         const uint32_t HIST_SUB_BLOCKS = DEFAULT_HIST_SUB_BLOCKS
         >
-void deviceRadixSort(uint32_t* tempMem, uint32_t tempMemSize, T *g_ikeys, T *g_okeys, TIndex *g_ivalsIndices, TIndex *g_ovalsIndices, uint32_t n) {
+void deviceRadixSort(uint32_t* tempMem, uint32_t tempMemSize, T *g_ikeys, T *g_okeys, uint32_t *g_ivalsIndices, uint32_t *g_ovalsIndices, uint32_t n) {
     // compute the global histogram
     assert(tempMemSize >= getDeviceRadixSortTempMemSize<T>(n));
 
@@ -901,7 +900,7 @@ void deviceRadixSort(uint32_t* tempMem, uint32_t tempMemSize, T *g_ikeys, T *g_o
                 sizeof(uint32_t) * RADIX * (n + (ITEMS_PER_THREAD * BLOCK_SIZE) - 1)/(ITEMS_PER_THREAD * BLOCK_SIZE) + sizeof(uint32_t)
         )));
 
-        globalBinning<T, TIndex, ITEMS_PER_THREAD, BLOCK_SIZE, RADIX, RADIX_LOG, RADIX_MASK>(
+        globalBinning<T, ITEMS_PER_THREAD, BLOCK_SIZE, RADIX, RADIX_LOG, RADIX_MASK>(
             digit %2 == 0 ? g_ikeys : g_okeys,
             digit %2 == 1 ? g_ikeys : g_okeys,
             digit %2 == 0 ? g_ivalsIndices : g_ovalsIndices,
@@ -918,9 +917,59 @@ void deviceRadixSort(uint32_t* tempMem, uint32_t tempMemSize, T *g_ikeys, T *g_o
         if (digit %2 == 1 && digit == ((sizeof(T) << 8) >> RADIX_LOG) - 1){
             // copy g_ikeys to g_okeys
             checkCUDA((cudaMemcpy(g_okeys, g_ikeys, sizeof(T) * n, cudaMemcpyDeviceToDevice)));
-            checkCUDA((cudaMemcpy(g_ovalsIndices, g_ivalsIndices, sizeof(TIndex) * n, cudaMemcpyDeviceToDevice)));
+            checkCUDA((cudaMemcpy(g_ovalsIndices, g_ivalsIndices, sizeof(uint32_t) * n, cudaMemcpyDeviceToDevice)));
         }
     }
+}
+
+template<typename TVals>
+__global__ void copyVals(uint32_t* g_ovalsIndices, TVals* g_ivals, TVals* g_ovals, uint32_t n) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        g_ovals[g_ovalsIndices[idx]] = g_ivals[idx];
+    }
+}
+
+/**
+* @brief Device Radix Sort with values
+*
+* @tparam T: type of keys (should be uint32_t or uint64_t)
+* @tparam RADIX: radix of the sort (should be 256 by default)
+* @tparam RADIX_LOG: log of the radix (should be 8 by default)
+* @tparam RADIX_MASK: mask of the radix (should be 255 by default)
+* @tparam ITEMS_PER_THREAD: number of items per thread durring binning (should be 16)
+* @tparam BLOCK_SIZE: size of the block (should be 256 by default)
+* @tparam HIST_PART_SIZE: size of the histogram part processed by each block (should be 16384 by default)
+* @tparam HIST_SUB_BLOCKS: number of histogram sub-blocks (should be 4 by default)
+* 
+* @param tempMem: temporary memory
+* @param tempMemSize: size of temporary memory
+* @param g_ikeys: input keys
+* @param g_okeys: output keys
+* @param g_ivalsIndices: input indices
+* @param g_ovalsIndices: output indices
+* @param n: number of elements
+*/
+template<typename T,
+        typename TVals,
+        const uint32_t RADIX = DEFAULT_RADIX,
+        const uint32_t RADIX_LOG = DEFAULT_RADIX_LOG,
+        const uint32_t RADIX_MASK = RADIX - 1,
+        const uint32_t ITEMS_PER_THREAD = DEFAULT_BINNING_ITEMS_PER_THREAD,
+        const uint32_t BLOCK_SIZE = DEFAULT_BINNING_BLOCK_SIZE,
+        const uint32_t HIST_PART_SIZE = DEFAULT_HIST_PART_SIZE,
+        const uint32_t HIST_SUB_BLOCKS = DEFAULT_HIST_SUB_BLOCKS
+        >
+void deviceRadixSortWithVals(uint32_t* tempMem, uint32_t tempMemSize, T *g_ikeys, T *g_okeys, TVals *g_ivals, TVals *g_ovals, uint32_t n) {
+    uint32_t* g_iValIndices = tempMem;
+    uint32_t* g_oValIndices = tempMem + n;
+    
+    deviceRadixSort<T, RADIX, RADIX_LOG, RADIX_MASK, ITEMS_PER_THREAD, BLOCK_SIZE, HIST_PART_SIZE, HIST_SUB_BLOCKS>(tempMem + 2 * n, 
+            tempMemSize - 2 * n, g_ikeys, g_okeys, g_iValIndices, g_oValIndices, n);
+
+    // copy values
+    const uint32_t numBlocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    checkCUDA((copyVals<TVals><<<numBlocks, BLOCK_SIZE>>>(g_oValIndices, g_ivals, g_ovals, n)));
 }
 
 
