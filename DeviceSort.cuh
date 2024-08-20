@@ -23,11 +23,11 @@
 template<typename T,
         const uint32_t HIST_PART_SIZE,
         const uint32_t HIST_SUB_BLOCKS,
-        const uint32_t BLOCK_SIZE,
+        const uint32_t HIST_BLOCK_SIZE,
         const uint32_t RADIX ,
         const uint32_t RADIX_LOG,
         const uint32_t RADIX_MASK
-        >
+>
 __global__ void globalByteHistogramImpl(T *g_ikeys, uint32_t *g_globalHistogram, uint32_t n) {
     const uint32_t numDigits = sizeof(T);
 
@@ -154,7 +154,7 @@ __forceinline__ __device__ void warpLevelScan(uint32_t* input, uint32_t* output,
         if (lane_id < size) {
             // concatinate with input if we have outputShift > 0
             output[read_id] = ((add_val + value - (exclusive ? input[read_id] : 0)) << outputShift) | (outputShift
-                    > 0 ? valueInit : 0);
+                                                                                                       > 0 ? valueInit : 0);
         }
         __syncwarp();
         size -= WARP_SIZE;
@@ -176,31 +176,30 @@ __forceinline__ __device__ void warpLevelScan(uint32_t* input, uint32_t* output,
 
 template<typename TKeys,
         const uint32_t ITEMS_PER_THREAD,  // default 32
-        const uint32_t BLOCK_SIZE, // THREADS_PER_BLOCK, default 256
+        const uint32_t BINNING_BLOCK_SIZE, // THREADS_PER_BLOCK, default 256
         const uint32_t RADIX,
         const uint32_t RADIX_LOG,
         const uint32_t RADIX_MASK
-        >
+>
 __global__ void globalBinningImpl(
         TKeys *g_ikeys,
         TKeys *g_okeys,
         uint32_t *g_ivalsIndices,
         uint32_t *g_ovalsIndices,
         uint32_t *g_exclusiveCount,          // the global prefix sum
-        uint32_t *g_atomicTileAssignCounter, // single value
         uint32_t *g_statusCounter,    // of size RADIX x number of TILES
         uint32_t n,
         uint32_t currentDigit
 ) {
     // figure out some useful constants
-    const uint32_t NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
-    const uint32_t BIN_TILE_SIZE = ITEMS_PER_THREAD * BLOCK_SIZE;
+    const uint32_t BIN_NUM_WARPS = BINNING_BLOCK_SIZE / WARP_SIZE;
+    const uint32_t BIN_TILE_SIZE = ITEMS_PER_THREAD * BINNING_BLOCK_SIZE;
 
     // active digit for global exclusive scan prefix sum for each bin (digit)
     uint32_t* g_activeExclusiveCount = g_exclusiveCount + currentDigit * RADIX;
 
     // declare shared memory, for each uint32_t entry, we have [exclusive sum | histogram]
-    __shared__ uint32_t s_warpHistograms[NUM_WARPS << RADIX_LOG];
+    __shared__ uint32_t s_warpHistograms[BIN_NUM_WARPS << RADIX_LOG];
     __shared__ uint32_t s_blockHistogram[RADIX];
     // an array to store the global (digit and tile) offset of each bin (digit)
     __shared__ uint32_t s_globalOffsets[RADIX];
@@ -248,7 +247,7 @@ __global__ void globalBinningImpl(
 
     //clear shared memory
     #pragma unroll
-    for (uint32_t i = threadIdx.x; i < RADIX * NUM_WARPS; i += BLOCK_SIZE) {
+    for (uint32_t i = threadIdx.x; i < RADIX * BIN_NUM_WARPS; i += BINNING_BLOCK_SIZE) {
         s_warpHistograms[i] = 0;
     }
     s_blockHistogram[threadIdx.x] = 0;
@@ -258,7 +257,7 @@ __global__ void globalBinningImpl(
     uint32_t tileId = blockIdx.x;
     // initialize counters
     #pragma unroll
-    for(uint32_t i = threadIdx.x; i < RADIX; i+= BLOCK_SIZE){
+    for(uint32_t i = threadIdx.x; i < RADIX; i+= BINNING_BLOCK_SIZE){
         g_statusCounter[gridDim.x * i + tileId] = COUNTER_FLAG_NOT_READY;
     }
 
@@ -296,7 +295,7 @@ __global__ void globalBinningImpl(
     threadKey14 = itemIndex < n ? g_ikeys[itemIndex] : (~((TKeys)0));
     itemIndex += WARP_SIZE;
     threadKey15 = itemIndex < n ? g_ikeys[itemIndex] : (~((TKeys)0));
-    
+
     __syncwarp();
 
     // perform warp level statistics
@@ -325,9 +324,9 @@ __global__ void globalBinningImpl(
     __syncthreads();
     // do a collection of warp conclusions into a single histogram
     #pragma unroll
-    for (uint32_t j = threadIdx.x; j < RADIX; j += BLOCK_SIZE) {
-        #pragma unroll NUM_WARPS
-        for (uint32_t i = 0; i < NUM_WARPS; i++) {
+    for (uint32_t j = threadIdx.x; j < RADIX; j += BINNING_BLOCK_SIZE) {
+        #pragma unroll BIN_NUM_WARPS
+        for (uint32_t i = 0; i < BIN_NUM_WARPS; i++) {
             // we add both histograms and exclusive sums in this way
             s_blockHistogram[j] += s_warpHistograms[RADIX * i + j];
         }
@@ -337,14 +336,14 @@ __global__ void globalBinningImpl(
 
     // update offsets for each warp group
     #pragma unroll
-    for (uint32_t j = threadIdx.x; j < RADIX; j += BLOCK_SIZE) {
+    for (uint32_t j = threadIdx.x; j < RADIX; j += BINNING_BLOCK_SIZE) {
         uint32_t runningSum = 0;
-        #pragma unroll NUM_WARPS
-        for (uint32_t i = 0; i < NUM_WARPS; i++) {
-           uint32_t val = s_warpHistograms[RADIX * i + j] & BIN_HIST_MASK;
-           // assign runningSum to the the exclusive sum components
-           s_warpHistograms[RADIX * i + j] = (runningSum << BIN_EXCL_SHIFT) | val;
-           runningSum += val;
+        #pragma unroll BIN_NUM_WARPS
+        for (uint32_t i = 0; i < BIN_NUM_WARPS; i++) {
+            uint32_t val = s_warpHistograms[RADIX * i + j] & BIN_HIST_MASK;
+            // assign runningSum to the the exclusive sum components
+            s_warpHistograms[RADIX * i + j] = (runningSum << BIN_EXCL_SHIFT) | val;
+            runningSum += val;
         }
     }
 
@@ -352,14 +351,14 @@ __global__ void globalBinningImpl(
 
     // report the local counters
     #pragma unroll
-    for (uint32_t j = threadIdx.x; j < RADIX; j += BLOCK_SIZE) {
+    for (uint32_t j = threadIdx.x; j < RADIX; j += BINNING_BLOCK_SIZE) {
         g_statusCounter[j * gridDim.x + tileId] =  COUNTER_FLAG_LOCAL_COUNT | (s_blockHistogram[j] & BIN_HIST_MASK);
     }
     __syncthreads();
 
     // Perform chained scan prefix sum for each digit
     #pragma unroll
-    for (uint32_t digit = threadIdx.x; digit < RADIX; digit += BLOCK_SIZE) {
+    for (uint32_t digit = threadIdx.x; digit < RADIX; digit += BINNING_BLOCK_SIZE) {
         uint32_t localCount = (s_blockHistogram[digit] & BIN_HIST_MASK);
         uint32_t exclusivePrefix = 0;
 
@@ -394,7 +393,7 @@ __global__ void globalBinningImpl(
     __syncthreads();
 
     #pragma unroll
-    for (uint32_t i = threadIdx.x; i < RADIX * NUM_WARPS; i += BLOCK_SIZE) {
+    for (uint32_t i = threadIdx.x; i < RADIX * BIN_NUM_WARPS; i += BINNING_BLOCK_SIZE) {
         // remove the lower bits
         s_digitPlacementStats[i] &= BIN_EXCL_MASK;
     }
@@ -407,14 +406,14 @@ __global__ void globalBinningImpl(
         // total offset = global digit offset + warp's offset + thread's offset
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank0 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             // scatter the key to the bin
             g_okeys[completeOffset] = threadKey0;
 
             // scatter the index into the output array
-            g_ovalsIndices[completeOffset] = g_ivalsIndices[tileId * BIN_TILE_SIZE + WARP_INDEX * WARP_SIZE * ITEMS_PER_THREAD + 0 * WARP_SIZE + LANE_INDEX];
+            g_ovalsIndices[completeOffset] = g_ivalsIndices[tileId * BIN_TILE_SIZE + WARP_INDEX * WARP_SIZE * ITEMS_PER_THREAD + LANE_INDEX];
         }
         __syncwarp();
         // if we are the lowest ranked thread in the warp, we need to update the global offset
@@ -430,7 +429,7 @@ __global__ void globalBinningImpl(
         // total offset = global digit offset + warp's offset + thread's offset
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank1 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             // scatter the key to the bin
@@ -446,14 +445,14 @@ __global__ void globalBinningImpl(
         }
         __syncwarp();
     }
-    
+
     // block 2
     {
         uint32_t digit = (threadKey2 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         // total offset = global digit offset + warp's offset + thread's offset
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank2 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             // scatter the key to the bin
@@ -475,7 +474,7 @@ __global__ void globalBinningImpl(
         uint32_t digit = (threadKey3 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank3 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             g_okeys[completeOffset] = threadKey3;
@@ -493,7 +492,7 @@ __global__ void globalBinningImpl(
         uint32_t digit = (threadKey4 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank4 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             g_okeys[completeOffset] = threadKey4;
@@ -511,7 +510,7 @@ __global__ void globalBinningImpl(
         uint32_t digit = (threadKey5 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank5 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             g_okeys[completeOffset] = threadKey5;
@@ -529,7 +528,7 @@ __global__ void globalBinningImpl(
         uint32_t digit = (threadKey6 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank6 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             g_okeys[completeOffset] = threadKey6;
@@ -547,7 +546,7 @@ __global__ void globalBinningImpl(
         uint32_t digit = (threadKey7 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank7 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             g_okeys[completeOffset] = threadKey7;
@@ -565,7 +564,7 @@ __global__ void globalBinningImpl(
         uint32_t digit = (threadKey8 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank8 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             g_okeys[completeOffset] = threadKey8;
@@ -583,7 +582,7 @@ __global__ void globalBinningImpl(
         uint32_t digit = (threadKey9 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank9 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             g_okeys[completeOffset] = threadKey9;
@@ -601,7 +600,7 @@ __global__ void globalBinningImpl(
         uint32_t digit = (threadKey10 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank10 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             g_okeys[completeOffset] = threadKey10;
@@ -619,7 +618,7 @@ __global__ void globalBinningImpl(
         uint32_t digit = (threadKey11 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank11 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             g_okeys[completeOffset] = threadKey11;
@@ -637,7 +636,7 @@ __global__ void globalBinningImpl(
         uint32_t digit = (threadKey12 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank12 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             g_okeys[completeOffset] = threadKey12;
@@ -655,7 +654,7 @@ __global__ void globalBinningImpl(
         uint32_t digit = (threadKey13 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank13 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             g_okeys[completeOffset] = threadKey13;
@@ -673,7 +672,7 @@ __global__ void globalBinningImpl(
         uint32_t digit = (threadKey14 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank14 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             g_okeys[completeOffset] = threadKey14;
@@ -691,7 +690,7 @@ __global__ void globalBinningImpl(
         uint32_t digit = (threadKey15 >> (currentDigit * RADIX_LOG)) & RADIX_MASK;
         uint32_t digitPlacementOffset = (s_digitPlacementStats[WARP_INDEX * RADIX + digit] & BIN_HIST_MASK) + (threadRank15 & RANK_MASK);
         uint32_t completeOffset = s_globalOffsets[digit] + ((s_warpHistograms[WARP_INDEX * RADIX + digit] & BIN_EXCL_MASK) >> BIN_EXCL_SHIFT)
-            + digitPlacementOffset;
+                                  + digitPlacementOffset;
 
         if (completeOffset < n){
             g_okeys[completeOffset] = threadKey15;
@@ -768,8 +767,7 @@ __global__ void countExclusiveScanImpl(uint32_t *g_idata, uint32_t *g_odata) {
     g_odata[bi] = temp[bi + bankOffsetB];
 }
 
-template<typename TIndex>
-__global__ void generateIndexArrayImpl(TIndex *g_indices, uint32_t n) {
+__global__ void generateIndexArrayImpl(uint32_t *g_indices, uint32_t n) {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         g_indices[idx] = idx;
@@ -780,18 +778,18 @@ __global__ void generateIndexArrayImpl(TIndex *g_indices, uint32_t n) {
 // ---------------------------- public interface ----------------------------
 // --------------------------------------------------------------------------
 
-template<typename TIndex,
-        const uint32_t BLOCK_SIZE = DEFAULT_BINNING_BLOCK_SIZE
-        >
-inline void generateIndexArray(TIndex *g_indices, uint32_t n) {
-    const uint32_t numBlocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    checkCUDA((generateIndexArrayImpl<TIndex><<<numBlocks, BLOCK_SIZE>>>(g_indices, n)));
+template<
+        const uint32_t BINNING_BLOCK_SIZE = DEFAULT_BINNING_BLOCK_SIZE
+>
+inline void generateIndexArray(uint32_t *g_indices, uint32_t n) {
+    const uint32_t numBlocks = (n + BINNING_BLOCK_SIZE - 1) / BINNING_BLOCK_SIZE;
+    checkCUDA((generateIndexArrayImpl<<<numBlocks, BINNING_BLOCK_SIZE>>>(g_indices, n)));
 }
 
 template<typename T,
         const uint32_t HIST_PART_SIZE,
         const uint32_t HIST_SUB_BLOCKS,
-        const uint32_t BLOCK_SIZE,
+        const uint32_t HIST_BLOCK_SIZE,
         const uint32_t RADIX,
         const uint32_t RADIX_LOG,
         const uint32_t RADIX_MASK
@@ -800,42 +798,43 @@ inline void globalHistogram(T *g_ikeys, uint32_t *g_globalHistogram, uint32_t n)
     assert(RADIX < WARP_SIZE * WARP_SIZE);
     const uint32_t numBlocks = (n + HIST_PART_SIZE - 1) / HIST_PART_SIZE;
     // run the global histogram
-    checkCUDA((globalByteHistogramImpl<T, HIST_PART_SIZE, HIST_SUB_BLOCKS, BLOCK_SIZE, RADIX, RADIX_LOG, RADIX_MASK>
-            <<<numBlocks, BLOCK_SIZE>>>(g_ikeys, g_globalHistogram, n)));
+    checkCUDA((globalByteHistogramImpl<T, HIST_PART_SIZE, HIST_SUB_BLOCKS, HIST_BLOCK_SIZE, RADIX, RADIX_LOG, RADIX_MASK>
+    <<<numBlocks, HIST_BLOCK_SIZE>>>(g_ikeys, g_globalHistogram, n)));
 }
 
 template<typename T,
         const uint32_t RADIX,
-        const uint32_t RADIX_LOG 
-        >
+        const uint32_t RADIX_LOG
+>
 inline void countExclusiveScan(uint32_t *g_globalHistogram, uint32_t *g_exclusiveCount) {
     const uint32_t numBlocks = sizeof(T) * 8 / RADIX_LOG;
     checkCUDA((countExclusiveScanImpl<T><<<numBlocks, RADIX / 2, RADIX>>>(g_globalHistogram, g_exclusiveCount)));
 }
 
-template<typename T, 
+template<typename T,
         const uint32_t ITEMS_PER_THREAD,
-        const uint32_t BLOCK_SIZE,
+        const uint32_t BINNING_BLOCK_SIZE,
         const uint32_t RADIX,
         const uint32_t RADIX_LOG,
         const uint32_t RADIX_MASK
-        >
-inline void globalBinning(T *g_ikeys, T *g_okeys, uint32_t *g_ivalsIndices, uint32_t *g_ovalsIndices, uint32_t *g_exclusiveCount, uint32_t *g_atomicTileAssignCounter, uint32_t *g_statusCounter, uint32_t n, uint32_t currentDigit) {
-    const uint32_t numBlocks = (n + ITEMS_PER_THREAD * BLOCK_SIZE - 1) / (ITEMS_PER_THREAD * BLOCK_SIZE);
-    checkCUDA((globalBinningImpl<T, ITEMS_PER_THREAD, BLOCK_SIZE, RADIX, RADIX_LOG, RADIX_MASK>
-            <<<numBlocks, BLOCK_SIZE>>>(g_ikeys, g_okeys, g_ivalsIndices, g_ovalsIndices, g_exclusiveCount, g_atomicTileAssignCounter, g_statusCounter, n, currentDigit)));
+>
+inline void globalBinning(T *g_ikeys, T *g_okeys, uint32_t *g_ivalsIndices, uint32_t *g_ovalsIndices, uint32_t *g_exclusiveCount, uint32_t *g_statusCounter, uint32_t n, uint32_t currentDigit) {
+    const uint32_t numBlocks = (n + ITEMS_PER_THREAD * BINNING_BLOCK_SIZE - 1) / (ITEMS_PER_THREAD * BINNING_BLOCK_SIZE);
+    checkCUDA((globalBinningImpl<T, ITEMS_PER_THREAD, BINNING_BLOCK_SIZE, RADIX, RADIX_LOG, RADIX_MASK>
+    <<<numBlocks, BINNING_BLOCK_SIZE>>>(g_ikeys, g_okeys, g_ivalsIndices, g_ovalsIndices, g_exclusiveCount, g_statusCounter, n, currentDigit)));
 }
 
 template<typename T,
-        const uint32_t RADIX = DEFAULT_RADIX, 
-        const uint32_t RADIX_LOG = DEFAULT_RADIX_LOG, 
-        const uint32_t ITEMS_PER_THREAD = DEFAULT_BINNING_ITEMS_PER_THREAD, 
-        const uint32_t BLOCK_SIZE = DEFAULT_BINNING_BLOCK_SIZE
-        >
+        const uint32_t RADIX = DEFAULT_RADIX,
+        const uint32_t RADIX_LOG = DEFAULT_RADIX_LOG,
+        const uint32_t ITEMS_PER_THREAD = DEFAULT_BINNING_ITEMS_PER_THREAD,
+        const uint32_t BINNING_BLOCK_SIZE = DEFAULT_BINNING_BLOCK_SIZE
+>
 uint32_t getDeviceRadixSortTempMemSize(uint32_t n, bool withEmbeddedIndices = true) {
+
     // size of 'g_globalHistogram' + size of 'g_exclusiveCount' + size of 'g_atomicTileAssignCounter' + size of 'g_statusCounter'
     return ((sizeof(T) << 8) >> RADIX_LOG) * RADIX * sizeof(uint32_t) + sizeof(uint32_t) * RADIX * ((sizeof(T) << 8) >> RADIX_LOG)
-           + sizeof(uint32_t) + sizeof(uint32_t) * RADIX * (n + (ITEMS_PER_THREAD * BLOCK_SIZE) - 1)/(ITEMS_PER_THREAD * BLOCK_SIZE)
+           + sizeof(uint32_t) * RADIX * (n + (ITEMS_PER_THREAD * BINNING_BLOCK_SIZE) - 1) / (ITEMS_PER_THREAD * BINNING_BLOCK_SIZE)
            + (withEmbeddedIndices ? 2 * sizeof(uint32_t) * n : 0);
 }
 
@@ -849,10 +848,10 @@ uint32_t getDeviceRadixSortTempMemSize(uint32_t n, bool withEmbeddedIndices = tr
 * @tparam RADIX_LOG: log of the radix (should be 8 by default)
 * @tparam RADIX_MASK: mask of the radix (should be 255 by default)
 * @tparam ITEMS_PER_THREAD: number of items per thread durring binning (should be 16)
-* @tparam BLOCK_SIZE: size of the block (should be 256 by default)
+* @tparam BINNING_BLOCK_SIZE: size of the block (should be 256 by default)
 * @tparam HIST_PART_SIZE: size of the histogram part processed by each block (should be 16384 by default)
 * @tparam HIST_SUB_BLOCKS: number of histogram sub-blocks (should be 4 by default)
-* 
+*
 * @param tempMem: temporary memory
 * @param tempMemSize: size of temporary memory
 * @param g_ikeys: input keys
@@ -866,19 +865,19 @@ template<typename T,
         const uint32_t RADIX_LOG = DEFAULT_RADIX_LOG,
         const uint32_t RADIX_MASK = RADIX - 1,
         const uint32_t ITEMS_PER_THREAD = DEFAULT_BINNING_ITEMS_PER_THREAD,
-        const uint32_t BLOCK_SIZE = DEFAULT_BINNING_BLOCK_SIZE,
+        const uint32_t BINNING_BLOCK_SIZE = DEFAULT_BINNING_BLOCK_SIZE,
         const uint32_t HIST_PART_SIZE = DEFAULT_HIST_PART_SIZE,
         const uint32_t HIST_SUB_BLOCKS = DEFAULT_HIST_SUB_BLOCKS
-        >
-void deviceRadixSort(uint32_t* tempMem, uint32_t tempMemSize, T *g_ikeys, T *g_okeys, uint32_t *g_ivalsIndices, uint32_t *g_ovalsIndices, uint32_t n) {
+>
+void deviceRadixSort(uint32_t* tempMem, uint64_t tempMemSize, T *g_ikeys, T *g_okeys, uint32_t *g_ivalsIndices, uint32_t *g_ovalsIndices, uint32_t n) {
     // compute the global histogram
-    assert(tempMemSize >= getDeviceRadixSortTempMemSize<T>(n));
+    assert(tempMemSize >= getDeviceRadixSortTempMemSize<T>(n, false));
 
     // clean temporary memory
     checkCUDA((cudaMemset(tempMem, 0, tempMemSize)));
 
     // front scan kernel
-    globalHistogram<T, HIST_PART_SIZE, HIST_SUB_BLOCKS, BLOCK_SIZE, RADIX, RADIX_LOG, RADIX_MASK>(g_ikeys, tempMem, n);
+    globalHistogram<T, HIST_PART_SIZE, HIST_SUB_BLOCKS, BINNING_BLOCK_SIZE, RADIX, RADIX_LOG, RADIX_MASK>(g_ikeys, tempMem, n);
 
     // Print all values in global exclusive count
     uint32_t* h_hist = new uint32_t[RADIX];
@@ -897,22 +896,20 @@ void deviceRadixSort(uint32_t* tempMem, uint32_t tempMemSize, T *g_ikeys, T *g_o
         checkCUDA((cudaMemset(
                 tempMem + RADIX * ((sizeof(T) << 8) >> RADIX_LOG) * 2,
                 0,
-                sizeof(uint32_t) * RADIX * (n + (ITEMS_PER_THREAD * BLOCK_SIZE) - 1)/(ITEMS_PER_THREAD * BLOCK_SIZE) + sizeof(uint32_t)
+                sizeof(uint32_t) * RADIX * (n + (ITEMS_PER_THREAD * BINNING_BLOCK_SIZE) - 1) / (ITEMS_PER_THREAD * BINNING_BLOCK_SIZE)
         )));
 
-        globalBinning<T, ITEMS_PER_THREAD, BLOCK_SIZE, RADIX, RADIX_LOG, RADIX_MASK>(
-            digit %2 == 0 ? g_ikeys : g_okeys,
-            digit %2 == 1 ? g_ikeys : g_okeys,
-            digit %2 == 0 ? g_ivalsIndices : g_ovalsIndices,
-            digit %2 == 1 ? g_ivalsIndices : g_ovalsIndices,
-            /* exclusive count */
-            tempMem + RADIX * ((sizeof(T) << 8) >> RADIX_LOG),  
-            /* atomic tile assign counter (put at the end of memory block to avoid unaligned access)*/
-            tempMem + RADIX * ((sizeof(T) << 8) >> RADIX_LOG) * 2 + sizeof(uint32_t) * RADIX * (n + (ITEMS_PER_THREAD * BLOCK_SIZE) - 1)/(ITEMS_PER_THREAD * BLOCK_SIZE),
-            /* status counter */
-            tempMem + RADIX * ((sizeof(T) << 8) >> RADIX_LOG) * 2,  
-            n, 
-            digit);
+        globalBinning<T, ITEMS_PER_THREAD, BINNING_BLOCK_SIZE, RADIX, RADIX_LOG, RADIX_MASK>(
+                digit %2 == 0 ? g_ikeys : g_okeys,
+                digit %2 == 1 ? g_ikeys : g_okeys,
+                digit %2 == 0 ? g_ivalsIndices : g_ovalsIndices,
+                digit %2 == 1 ? g_ivalsIndices : g_ovalsIndices,
+                /* exclusive count */
+                tempMem + RADIX * ((sizeof(T) << 8) >> RADIX_LOG),
+                /* status counter */
+                tempMem + RADIX * ((sizeof(T) << 8) >> RADIX_LOG) * 2,
+                n,
+                digit);
 
         if (digit %2 == 1 && digit == ((sizeof(T) << 8) >> RADIX_LOG) - 1){
             // copy g_ikeys to g_okeys
@@ -926,7 +923,7 @@ template<typename TVals>
 __global__ void copyVals(uint32_t* g_ovalsIndices, TVals* g_ivals, TVals* g_ovals, uint32_t n) {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        g_ovals[g_ovalsIndices[idx]] = g_ivals[idx];
+        g_ovals[idx] = g_ivals[g_ovalsIndices[idx]];
     }
 }
 
@@ -938,10 +935,10 @@ __global__ void copyVals(uint32_t* g_ovalsIndices, TVals* g_ivals, TVals* g_oval
 * @tparam RADIX_LOG: log of the radix (should be 8 by default)
 * @tparam RADIX_MASK: mask of the radix (should be 255 by default)
 * @tparam ITEMS_PER_THREAD: number of items per thread durring binning (should be 16)
-* @tparam BLOCK_SIZE: size of the block (should be 256 by default)
+* @tparam BINNING_BLOCK_SIZE: size of the block (should be 256 by default)
 * @tparam HIST_PART_SIZE: size of the histogram part processed by each block (should be 16384 by default)
 * @tparam HIST_SUB_BLOCKS: number of histogram sub-blocks (should be 4 by default)
-* 
+*
 * @param tempMem: temporary memory
 * @param tempMemSize: size of temporary memory
 * @param g_ikeys: input keys
@@ -956,20 +953,24 @@ template<typename T,
         const uint32_t RADIX_LOG = DEFAULT_RADIX_LOG,
         const uint32_t RADIX_MASK = RADIX - 1,
         const uint32_t ITEMS_PER_THREAD = DEFAULT_BINNING_ITEMS_PER_THREAD,
-        const uint32_t BLOCK_SIZE = DEFAULT_BINNING_BLOCK_SIZE,
+        const uint32_t BINNING_BLOCK_SIZE = DEFAULT_BINNING_BLOCK_SIZE,
         const uint32_t HIST_PART_SIZE = DEFAULT_HIST_PART_SIZE,
         const uint32_t HIST_SUB_BLOCKS = DEFAULT_HIST_SUB_BLOCKS
-        >
-void deviceRadixSortWithVals(uint32_t* tempMem, uint32_t tempMemSize, T *g_ikeys, T *g_okeys, TVals *g_ivals, TVals *g_ovals, uint32_t n) {
+>
+void deviceRadixSortWithVals(uint32_t* tempMem, uint64_t tempMemSize, T *g_ikeys, T *g_okeys, TVals *g_ivals, TVals *g_ovals, uint32_t n) {
     uint32_t* g_iValIndices = tempMem;
     uint32_t* g_oValIndices = tempMem + n;
-    
-    deviceRadixSort<T, RADIX, RADIX_LOG, RADIX_MASK, ITEMS_PER_THREAD, BLOCK_SIZE, HIST_PART_SIZE, HIST_SUB_BLOCKS>(tempMem + 2 * n, 
-            tempMemSize - 2 * n, g_ikeys, g_okeys, g_iValIndices, g_oValIndices, n);
+
+    // generate index array
+    generateIndexArray(g_iValIndices, n);
+
+    // sort keys
+    deviceRadixSort<T, RADIX, RADIX_LOG, RADIX_MASK, ITEMS_PER_THREAD, BINNING_BLOCK_SIZE, HIST_PART_SIZE, HIST_SUB_BLOCKS>(tempMem + 2 * n,
+             tempMemSize - 2 * n * sizeof(uint32_t), g_ikeys, g_okeys, g_iValIndices, g_oValIndices, n);
 
     // copy values
-    const uint32_t numBlocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    checkCUDA((copyVals<TVals><<<numBlocks, BLOCK_SIZE>>>(g_oValIndices, g_ivals, g_ovals, n)));
+    const uint32_t numBlocks = (n + BINNING_BLOCK_SIZE - 1) / BINNING_BLOCK_SIZE;
+    checkCUDA((copyVals<TVals><<<numBlocks, BINNING_BLOCK_SIZE>>>(g_oValIndices, g_ivals, g_ovals, n)));
 }
 
 

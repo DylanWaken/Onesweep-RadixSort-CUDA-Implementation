@@ -21,7 +21,7 @@
 
 template <typename T>
 __global__ void sumImpl(size_t n, T* g_idata, T* g_odata, bool inclusive = true, bool collect_last = false,
-                 T* g_last_element_array = nullptr){
+                        T* g_last_element_array = nullptr){
     extern __shared__ T temp[];// allocated on invocation
 
     uint32_t thid = threadIdx.x;
@@ -110,7 +110,7 @@ __global__ void scanDistrib(T* g_sum_output, size_t n, uint32_t op_size, T* g_la
     g_sum_output[gid] += last_element;
 }
 
-__forceinline__ size_t compute_temp_size(size_t n, uint32_t op_size){
+__forceinline__ size_t getDeviceScanTempSize(size_t n, uint32_t op_size = 2 * 512){
     size_t temp_size = 0;
     while ((n + op_size - 1) / op_size > 1){
         uint32_t nNext = (n + op_size - 1) / op_size;
@@ -123,59 +123,59 @@ __forceinline__ size_t compute_temp_size(size_t n, uint32_t op_size){
 /**
  * @brief an recursive inclusive index sum, optimized
  * @tparam T the type of the data
- * @tparam BLOCK_SIZE the block size
- * @param g_temp the temporary memory, used when n > 2 * BLOCK_SIZE and recursive call is needed
+ * @tparam SCAN_BLOCK_SIZE the block size
+ * @param g_temp the temporary memory, used when n > 2 * SCAN_BLOCK_SIZE and recursive call is needed
  * @param n the size of the input
  * @param g_idata the input data
  * @param g_odata the output data
  */
-template <typename T, const uint32_t BLOCK_SIZE = 512>
+template <typename T, const uint32_t SCAN_BLOCK_SIZE = 512>
 void inclusiveSum(T* g_temp, size_t temp_size, T* g_idata, T* g_odata,  size_t n){
-    dim3 block(BLOCK_SIZE);
-    uint32_t op_size = 2 * BLOCK_SIZE;
+    dim3 block(SCAN_BLOCK_SIZE);
+    uint32_t op_size = 2 * SCAN_BLOCK_SIZE;
     dim3 grid((n + op_size - 1) / op_size);
-    assert(temp_size >= compute_temp_size(n, op_size));
+    assert(temp_size >= getDeviceScanTempSize(n, op_size));
 
     bool proceed_recursion = (n + op_size - 1) / op_size > 1;
 
     // run the sum on each block
     checkCUDA((sumImpl<T><<<grid, block, sizeof(T) * op_size
-        + CONFLICT_FREE_OFFSET(op_size) * sizeof(T)>>>(n, g_idata, g_odata, true,proceed_recursion, g_temp)));
+                                         + CONFLICT_FREE_OFFSET(op_size) * sizeof(T)>>>(n, g_idata, g_odata, true,proceed_recursion, g_temp)));
 
     if (proceed_recursion){
         uint32_t nNext = (n + op_size - 1) / op_size;
 
         // run the sum
-        inclusiveSum<T, BLOCK_SIZE>(g_temp + 2 * nNext, temp_size - 2 * nNext, g_temp, g_temp + nNext, nNext);
+        inclusiveSum<T, SCAN_BLOCK_SIZE>(g_temp + 2 * nNext, temp_size - 2 * nNext, g_temp, g_temp + nNext, nNext);
 
         // distribute the last element
-        checkCUDA((scanDistrib<T><<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE, block>>>
-            (g_odata, n, op_size, g_temp + nNext)));
+        checkCUDA((scanDistrib<T><<<(n + SCAN_BLOCK_SIZE - 1) / SCAN_BLOCK_SIZE, block>>>
+                (g_odata, n, op_size, g_temp + nNext)));
     }
 }
 
 
-template <typename T, const uint32_t BLOCK_SIZE = 512>
+template <typename T, const uint32_t SCAN_BLOCK_SIZE = 512>
 void exclusiveSum(T* g_temp, size_t temp_size, T* g_idata, T* g_odata,  size_t n){
-    dim3 block(BLOCK_SIZE);
-    uint32_t op_size = 2 * BLOCK_SIZE;
+    dim3 block(SCAN_BLOCK_SIZE);
+    uint32_t op_size = 2 * SCAN_BLOCK_SIZE;
     dim3 grid((n + op_size - 1) / op_size);
-    assert(temp_size >= compute_temp_size(n, op_size));
+    assert(temp_size >= getDeviceScanTempSize(n, op_size));
 
     bool proceed_recursion = (n + op_size - 1) / op_size > 1;
 
     // run the sum on each block
     checkCUDA((sumImpl<T><<<grid, block, sizeof(T) * op_size
-          + CONFLICT_FREE_OFFSET(op_size) * sizeof(T)>>>(n, g_idata, g_odata, false, proceed_recursion, g_temp)));
+                                         + CONFLICT_FREE_OFFSET(op_size) * sizeof(T)>>>(n, g_idata, g_odata, false, proceed_recursion, g_temp)));
 
     if (proceed_recursion){
         uint32_t nNext = (n + op_size - 1) / op_size;
 
         // run the sum (note we use inclusive sum for sub-problems)
-        inclusiveSum<T, BLOCK_SIZE>(g_temp + 2 * nNext, temp_size - 2 * nNext, g_temp, g_temp + nNext, nNext);
+        inclusiveSum<T, SCAN_BLOCK_SIZE>(g_temp + 2 * nNext, temp_size - 2 * nNext, g_temp, g_temp + nNext, nNext);
 
         // distribute the last element
-        checkCUDA((scanDistrib<T><<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE, block>>>
+        checkCUDA((scanDistrib<T><<<(n + SCAN_BLOCK_SIZE - 1) / SCAN_BLOCK_SIZE, block>>>
                 (g_odata, n, op_size, g_temp + nNext)));
     }
 }

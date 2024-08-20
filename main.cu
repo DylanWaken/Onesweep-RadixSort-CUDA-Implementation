@@ -24,7 +24,7 @@ void checkScan() {
     cudaMalloc(&d_input, size * sizeof(uint32_t));
     cudaMalloc(&d_inclusive_output, size * sizeof(uint32_t));
     cudaMalloc(&d_exclusive_output, size * sizeof(uint32_t));
-    uint32_t temp_size = compute_temp_size(size, 512);
+    uint32_t temp_size = getDeviceScanTempSize(size);
     cudaMalloc(&d_temp, temp_size * sizeof(uint32_t));
 
     // Copy input data to device
@@ -60,8 +60,8 @@ void checkScan() {
         exclusive_sum += h_input[i];
     }
 
-    std::cout << "Inclusive sum test " << (inclusive_correct ? "passed" : "failed") << std::endl;
-    std::cout << "Exclusive sum test " << (exclusive_correct ? "passed" : "failed") << std::endl;
+    std::cout << "Inclusive sum test " << (inclusive_correct ? "passed" : "FAILED") << std::endl;
+    std::cout << "Exclusive sum test " << (exclusive_correct ? "passed" : "FAILED") << std::endl;
 
     // Clean up
     delete[] h_input;
@@ -74,39 +74,38 @@ void checkScan() {
 
 void testDeviceRadixSort(uint32_t test_size) {
     // Generate random uint32_t array
-    uint32_t* h_input = new uint32_t[test_size];
+    uint64_t* h_input = new uint64_t[test_size];
     for (uint32_t i = 0; i < test_size; i++) {
-        h_input[i] = rand() % (1<<30) + 1;
+        h_input[i] = ((uint64_t) rand() % (1 << 29)) * ((uint64_t) rand() % (1 << 29));
     }
 
 
     // Allocate device memory
-    uint32_t* d_input;
-    uint32_t* d_output;
+    uint64_t* d_input;
+    uint64_t* d_output;
     uint32_t* d_indices_in;
     uint32_t* d_indices_out;
-    cudaMalloc(&d_input, sizeof(uint32_t) * test_size);
-    cudaMalloc(&d_output, sizeof(uint32_t) * test_size);
+    cudaMalloc(&d_input, sizeof(uint64_t) * test_size);
+    cudaMalloc(&d_output, sizeof(uint64_t) * test_size);
     cudaMalloc(&d_indices_in, sizeof(uint32_t) * test_size);
     cudaMalloc(&d_indices_out, sizeof(uint32_t) * test_size);
 
     // Copy input data to device
-    cudaMemcpy(d_input, h_input, sizeof(uint32_t) * test_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input, h_input, sizeof(uint64_t) * test_size, cudaMemcpyHostToDevice);
 
     // Generate index array
-    generateIndexArray<uint32_t>(d_indices_in, test_size);
-
+    generateIndexArray(d_indices_in, test_size);
 
     // Allocate temporary memory for radix sort
-    uint32_t tempMemSize = getDeviceRadixSortTempMemSize<uint32_t>(test_size);
+    uint32_t tempMemSize = getDeviceRadixSortTempMemSize<uint64_t>(test_size, false);
     uint32_t* d_tempMem;
     cudaMalloc(&d_tempMem, tempMemSize);
 
     // Perform device radix sort
-    deviceRadixSort<uint32_t>(d_tempMem, tempMemSize, d_input, d_output, d_indices_in, d_indices_out, test_size);
+    deviceRadixSort<uint64_t>(d_tempMem, tempMemSize, d_input, d_output, d_indices_in, d_indices_out, test_size);
     // Copy result back to host
-    uint32_t* h_output = new uint32_t[test_size];
-    cudaMemcpy(h_output, d_output, sizeof(uint32_t) * test_size, cudaMemcpyDeviceToHost);
+    uint64_t* h_output = new uint64_t[test_size];
+    cudaMemcpy(h_output, d_output, sizeof(uint64_t) * test_size, cudaMemcpyDeviceToHost);
 
     // Verify sorting
     bool sorted = true;
@@ -116,7 +115,7 @@ void testDeviceRadixSort(uint32_t test_size) {
         }
     }
 
-    std::cout << "Sorting test " << (sorted ? "passed" : "failed") << std::endl;
+    std::cout << "Sorting test " << (sorted ? "passed" : "FAILED") << std::endl;
 
     // Clean up
     delete[] h_input;
@@ -128,11 +127,64 @@ void testDeviceRadixSort(uint32_t test_size) {
     cudaFree(d_tempMem);
 }
 
+void testDeviceRadixSortWithVals(uint32_t test_size) {
+    // Generate random uint32_t array
+    uint64_t* h_input = new uint64_t[test_size];
+    for (uint32_t i = 0; i < test_size; i++) {
+        h_input[i] = ((uint64_t) rand() % (1 << 29));
+    }
+
+
+    // Allocate device memory
+    uint64_t* d_input;
+    uint64_t* d_output;
+    uint64_t* d_vals_in;
+    uint64_t* d_vals_out;
+    checkCUDA(cudaMalloc(&d_input, sizeof(uint64_t) * test_size));
+    checkCUDA(cudaMalloc(&d_output, sizeof(uint64_t) * test_size));
+    checkCUDA(cudaMalloc(&d_vals_in, sizeof(uint64_t) * test_size));
+    checkCUDA(cudaMalloc(&d_vals_out, sizeof(uint64_t) * test_size));
+
+    // Copy input data to device
+    checkCUDA(cudaMemcpy(d_input, h_input, sizeof(uint64_t) * test_size, cudaMemcpyHostToDevice));
+    checkCUDA(cudaMemcpy(d_vals_in, h_input, sizeof(uint64_t) * test_size, cudaMemcpyHostToDevice));
+
+    // Allocate temporary memory for radix sort
+    uint32_t tempMemSize = getDeviceRadixSortTempMemSize<uint64_t>(test_size);
+    uint32_t* d_tempMem;
+    checkCUDA(cudaMalloc(&d_tempMem, tempMemSize));
+
+    // Perform device radix sort
+    deviceRadixSortWithVals<uint64_t>(d_tempMem, tempMemSize, d_input, d_output, d_vals_in, d_vals_out, test_size);
+    // Copy result back to host
+    uint64_t* h_output = new uint64_t[test_size];
+    cudaMemcpy(h_output, d_vals_out, sizeof(uint64_t) * test_size, cudaMemcpyDeviceToHost);
+
+    // Verify sorting
+    bool sorted = true;
+    for (uint32_t i = 1; i < test_size; i++) {
+        if (h_output[i] < h_output[i - 1]) {
+            sorted = false;
+        }
+    }
+
+    std::cout << "Sorting test " << (sorted ? "passed" : "FAILED") << std::endl;
+
+    // Clean up
+    delete[] h_input;
+    delete[] h_output;
+    cudaFree(d_input);
+    cudaFree(d_output);
+    cudaFree(d_vals_in);
+    cudaFree(d_vals_out);
+    cudaFree(d_tempMem);
+}
 
 
 int main() {
     checkScan();
     // test by number of blocks and a non block offset
     testDeviceRadixSort(DEFAULT_BINNING_ITEMS_PER_THREAD * DEFAULT_BINNING_BLOCK_SIZE * 32 + 1031);
+    testDeviceRadixSortWithVals(DEFAULT_BINNING_ITEMS_PER_THREAD * DEFAULT_BINNING_BLOCK_SIZE * 32 + 1031);
     return 0;
 }
